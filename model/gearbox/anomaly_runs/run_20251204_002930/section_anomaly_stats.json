@@ -1,0 +1,23 @@
+{
+  "0": {
+    "input_dim": 220,
+    "threshold": 0.45999999999999996,
+    "val_acc": 0.9036544850498339,
+    "num_train": 1207,
+    "num_val": 301
+  },
+  "1": {
+    "input_dim": 220,
+    "threshold": 0.52,
+    "val_acc": 0.8576388888888888,
+    "num_train": 1155,
+    "num_val": 288
+  },
+  "2": {
+    "input_dim": 220,
+    "threshold": 0.59,
+    "val_acc": 0.8412162162162162,
+    "num_train": 1186,
+    "num_val": 296
+  }
+}
