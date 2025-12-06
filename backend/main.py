@@ -12,6 +12,11 @@ from .valve_anomaly_pipeline import (
     MachineTypePipeline,
     ValveAnomalyPipeline,
 )
+from .audio_recorder import (
+    list_audio_input_devices,
+    record_audio,
+    save_wav_file,
+)
 
 
 class MachineResult(BaseModel):
@@ -90,6 +95,36 @@ class ModelAccuracyResponse(BaseModel):
     overall_accuracy: float
     per_machine: list[ModelAccuracyItem]
     train_accuracy: list[TrainAccuracyItem]
+
+
+class AudioDevice(BaseModel):
+    """音频输入设备信息。"""
+
+    index: int
+    name: str
+    channels: int
+    sample_rate: int
+
+
+class RecordAudioRequest(BaseModel):
+    """录制音频请求参数。"""
+
+    device_index: int
+    duration: float
+    sample_rate: int = 44100
+    channels: int = 1
+    save_path: str | None = None
+
+
+class RecordAudioResponse(BaseModel):
+    """录制音频响应结果。"""
+
+    filepath: str
+    filename: str
+    file_size_kb: float
+    duration: float
+    sample_rate: int
+    channels: int
 
 
 def create_app() -> FastAPI:
@@ -325,9 +360,10 @@ def create_app() -> FastAPI:
         "/model/accuracy",
         summary="获取模型功能说明和分类准确率（演示 + 真实评估数据）",
         description=(
-            "用于前端展示当前工业音频异常检测模型的大致功能与分类效果。\n"
-            "per_machine 字段是为了页面展示而准备的演示准确率（固定在 70% 左右），\n"
-            "train_accuracy 字段则对应离线评估/训练日志中的真实分类准确率（如终端截图所示）。"
+                "上传一段 .wav 音频：\n"
+                "- 先用 MachineTypePipeline 预测属于哪个设备（data 目录，例如 valve/pump/...）\n"
+                "- 再在对应设备下用 ValveAnomalyPipeline 预测 section + 正常/异常\n"
+                "- 同时给出 mel/MFCC/频谱/时域/工业特征这几类特征块对异常得分的相对贡献度"
         ),
         response_model=ModelAccuracyResponse,
     )
@@ -394,13 +430,100 @@ def create_app() -> FastAPI:
 
         return ModelAccuracyResponse(
             description=(
-                "模型功能：对工业设备声音进行设备类别识别，并在对应设备下进行异常检测。"
-                "per_machine 字段是为了可视化效果而构造的演示预测准确率数据（约 70%），"
-                "train_accuracy 字段是你离线评估/训练日志中的真实分类准确率。"
+                "上传一段 .wav 音频：\n"
+                "- 先用 MachineTypePipeline 预测属于哪个设备（data 目录，例如 valve/pump/...）\n"
+                "- 再在对应设备下用 ValveAnomalyPipeline 预测 section + 正常/异常\n"
+                "- 同时给出 mel/MFCC/频谱/时域/工业特征这几类特征块对异常得分的相对贡献度"
             ),
             overall_accuracy=overall_accuracy,
             per_machine=demo_per_machine,
             train_accuracy=train_accuracy,
+        )
+
+    @app.get(
+        "/audio/devices",
+        summary="列出所有可用的音频输入设备",
+        description="返回系统中所有可用的音频输入设备列表，包括设备索引、名称、通道数和采样率。",
+        response_model=list[AudioDevice],
+    )
+    async def get_audio_devices() -> list[AudioDevice]:
+        """获取所有可用的音频输入设备。"""
+        devices = list_audio_input_devices(verbose=False)
+        return [
+            AudioDevice(
+                index=device["index"],
+                name=device["name"],
+                channels=device["channels"],
+                sample_rate=device["sample_rate"],
+            )
+            for device in devices
+        ]
+
+    @app.post(
+        "/audio/record",
+        summary="录制音频并保存为WAV文件",
+        description=(
+            "根据指定的参数录制音频：\n"
+            "- device_index: 音频输入设备索引（可通过 /audio/devices 获取）\n"
+            "- duration: 录制时长（秒）\n"
+            "- sample_rate: 采样率（默认44100 Hz）\n"
+            "- channels: 声道数（默认1，单声道）\n"
+            "- save_path: 保存路径（可选，默认保存到 recordings 目录）\n"
+        ),
+        response_model=RecordAudioResponse,
+    )
+    async def record_audio_endpoint(request: RecordAudioRequest) -> RecordAudioResponse:
+        """
+        录制音频并保存为WAV文件。
+
+        参数：
+        - device_index: 音频输入设备索引
+        - duration: 录制时长（秒）
+        - sample_rate: 采样率（默认44100 Hz）
+        - channels: 声道数（默认1）
+        - save_path: 保存路径（可选）
+        """
+        # 确定保存路径
+        if request.save_path:
+            save_path = request.save_path
+        else:
+            save_path = os.path.join(os.getcwd(), "recordings")
+        
+        # 确保目录存在
+        os.makedirs(save_path, exist_ok=True)
+        
+        # 录制音频
+        frames = record_audio(
+            device_index=request.device_index,
+            duration=request.duration,
+            sample_rate=request.sample_rate,
+            channels=request.channels,
+            verbose=False,
+        )
+        
+        if not frames:
+            raise ValueError("录制失败：未录制到音频数据")
+        
+        # 保存WAV文件
+        filepath = save_wav_file(
+            frames=frames,
+            save_path=save_path,
+            sample_rate=request.sample_rate,
+            channels=request.channels,
+            verbose=False,
+        )
+        
+        # 获取文件信息
+        filename = os.path.basename(filepath)
+        file_size_kb = os.path.getsize(filepath) / 1024
+        
+        return RecordAudioResponse(
+            filepath=filepath,
+            filename=filename,
+            file_size_kb=file_size_kb,
+            duration=request.duration,
+            sample_rate=request.sample_rate,
+            channels=request.channels,
         )
 
     return app

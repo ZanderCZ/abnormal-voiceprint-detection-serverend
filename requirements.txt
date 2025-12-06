@@ -4,5 +4,8 @@ librosa
 soundfile
 tqdm
 gradio
+pyaudio
+fastapi
+uvicorn
 
 
