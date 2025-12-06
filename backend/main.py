@@ -60,6 +60,38 @@ class InferExplainResponse(BaseModel):
     anomaly: AnomalyExplainResult
 
 
+class ModelAccuracyItem(BaseModel):
+    """单个设备类型的演示准确率（大约 70% 左右，用于展示预测准确度）。"""
+
+    machine_name: str
+    accuracy: float
+
+
+class TrainAccuracyItem(BaseModel):
+    """在离线评估/验证集上，每个设备类型的真实分类准确率。"""
+
+    machine_name: str
+    accuracy: float
+    correct: int
+    total: int
+
+
+class ModelAccuracyResponse(BaseModel):
+    """
+    模型整体功能介绍 + 准确率信息。
+
+    - description: 文本介绍模型功能
+    - overall_accuracy: 演示用的整体预测准确率（约 70%）
+    - per_machine: 每个设备的演示预测准确率（约 70%）
+    - train_accuracy: 离线评估时，每个设备的真实分类准确率（如终端截图所示）
+    """
+
+    description: str
+    overall_accuracy: float
+    per_machine: list[ModelAccuracyItem]
+    train_accuracy: list[TrainAccuracyItem]
+
+
 def create_app() -> FastAPI:
     """
     创建 FastAPI 应用：
@@ -288,6 +320,88 @@ def create_app() -> FastAPI:
         if names is None:
             return []
         return list(names)
+
+    @app.get(
+        "/model/accuracy",
+        summary="获取模型功能说明和分类准确率（演示 + 真实评估数据）",
+        description=(
+            "用于前端展示当前工业音频异常检测模型的大致功能与分类效果。\n"
+            "per_machine 字段是为了页面展示而准备的演示准确率（固定在 70% 左右），\n"
+            "train_accuracy 字段则对应离线评估/训练日志中的真实分类准确率（如终端截图所示）。"
+        ),
+        response_model=ModelAccuracyResponse,
+    )
+    async def get_model_accuracy() -> ModelAccuracyResponse:
+        # 1) 前端用于展示“预测准确率”的演示数据（约 70% 左右）
+        demo_per_machine = [
+            ModelAccuracyItem(machine_name="ToyCar", accuracy=0.72),
+            ModelAccuracyItem(machine_name="ToyTrain", accuracy=0.75),
+            ModelAccuracyItem(machine_name="fan", accuracy=0.69),
+            ModelAccuracyItem(machine_name="gearbox", accuracy=0.71),
+            ModelAccuracyItem(machine_name="pump", accuracy=0.73),
+            ModelAccuracyItem(machine_name="slider", accuracy=0.68),
+            ModelAccuracyItem(machine_name="valve", accuracy=0.74),
+        ]
+        overall_accuracy = sum(m.accuracy for m in demo_per_machine) / len(
+            demo_per_machine
+        )
+
+        # 2) 根据你训练日志中的结果（截图）填写的真实分类准确率
+        train_accuracy = [
+            TrainAccuracyItem(
+                machine_name="ToyCar",
+                accuracy=0.9689,
+                correct=4078,
+                total=4209,
+            ),
+            TrainAccuracyItem(
+                machine_name="ToyTrain",
+                accuracy=0.9990,
+                correct=4205,
+                total=4209,
+            ),
+            TrainAccuracyItem(
+                machine_name="fan",
+                accuracy=0.7021,
+                correct=2955,
+                total=4209,
+            ),
+            TrainAccuracyItem(
+                machine_name="gearbox",
+                accuracy=0.6661,
+                correct=2953,
+                total=4433,
+            ),
+            TrainAccuracyItem(
+                machine_name="pump",
+                accuracy=0.9613,
+                correct=4046,
+                total=4209,
+            ),
+            TrainAccuracyItem(
+                machine_name="slider",
+                accuracy=0.7807,
+                correct=3297,
+                total=4223,
+            ),
+            TrainAccuracyItem(
+                machine_name="valve",
+                accuracy=0.9815,
+                correct=4131,
+                total=4209,
+            ),
+        ]
+
+        return ModelAccuracyResponse(
+            description=(
+                "模型功能：对工业设备声音进行设备类别识别，并在对应设备下进行异常检测。"
+                "per_machine 字段是为了可视化效果而构造的演示预测准确率数据（约 70%），"
+                "train_accuracy 字段是你离线评估/训练日志中的真实分类准确率。"
+            ),
+            overall_accuracy=overall_accuracy,
+            per_machine=demo_per_machine,
+            train_accuracy=train_accuracy,
+        )
 
     return app
 
