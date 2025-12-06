@@ -1376,7 +1376,395 @@ class ValveAnomalyPipeline:
             mlp.load_state_dict(ckpt["state_dict"])
             mlp.eval()
             self.anomaly_models[sec] = mlp
-            self.thresholds[sec] = th
+        self.thresholds[sec] = th
+
+        if not self.anomaly_models:
+            print(
+                "[ValveAnomalyPipeline] Warning: no anomaly models loaded. "
+                "Please ensure you have run --train_ae for this device."
+            )
+
+        # 可选：加载特征重要性的“正常基线”（mean/std），用于 z-score 判断
+        self.feature_baseline: Dict[int, Dict[str, Dict[str, float]]] = {}
+        baseline_path = os.path.join(self.model_dir, "feature_baseline.json")
+        if os.path.exists(baseline_path):
+            try:
+                with open(baseline_path, "r", encoding="utf-8") as f:
+                    raw_baseline: Dict[str, Dict[str, Dict[str, float]]] = json.load(f)
+                for sec_str, gstats in raw_baseline.items():
+                    self.feature_baseline[int(sec_str)] = gstats
+            except Exception as e:
+                print(
+                    f"[ValveAnomalyPipeline] Warning: failed to load feature_baseline "
+                    f"from {baseline_path} ({e}). Continue without baseline."
+                )
+
+        # 尝试加载特征基线（用于解释各特征类型是否“偏离正常”）
+        self.feature_baseline: Dict[str, Dict[str, Dict[str, float]]] = {}
+        baseline_path = os.path.join(self.model_dir, "feature_baseline.json")
+        if os.path.exists(baseline_path):
+            try:
+                with open(baseline_path, "r", encoding="utf-8") as f:
+                    self.feature_baseline = json.load(f)
+            except Exception as e:
+                print(
+                    f"[ValveAnomalyPipeline] Warning: failed to load feature_baseline "
+                    f"from {baseline_path}: {e}"
+                )
+
+    @torch.no_grad()
+    def predict_section(self, wav_path: str) -> int:
+        """
+        预测所属 section。
+        注意：某些设备的数据集中，可能并不存在所有 section 编号（例如只存在 1、2，没有 0），
+        但 CNN 输出的维度仍然是 [0..n_sections-1]。
+
+        为了避免预测到“没有异常模型/阈值的 section”，这里会只在
+        self.anomaly_models.keys() 这些有效 section 上选取概率最大的那个。
+        """
+        # CNN 分支（log-mel 频谱）
+        x = extract_feature(wav_path)
+        xt = torch.from_numpy(x).unsqueeze(0).to(self.device)
+        logits_cnn = self.section_model(xt)  # [1, n_sections]
+        prob_cnn = F.softmax(logits_cnn, dim=1).cpu().numpy()[0]
+
+        # 如果没有 hand-crafted MLP，则只用 CNN 概率
+        if self.section_mlp is None:
+            prob_fused = prob_cnn
+        else:
+            # MLP 分支（手工特征）
+            fv = extract_feature_vector(wav_path)
+            xf = torch.from_numpy(fv).unsqueeze(0).to(self.device)  # [1, D]
+            logits_mlp = self.section_mlp(xf)  # [1, n_sections]
+            prob_mlp = F.softmax(logits_mlp, dim=1).cpu().numpy()[0]
+            # 简单平均融合（你可以根据效果再调整权重）
+            prob_fused = 0.5 * prob_cnn + 0.5 * prob_mlp
+
+        # 只在“确实训练过异常检测模型”的 section 集合上取最大概率
+        valid_secs = sorted(self.anomaly_models.keys())
+        best_sec = None
+        best_prob = -1.0
+        for sec in valid_secs:
+            if sec < 0 or sec >= len(prob_fused):
+                continue
+            p = float(prob_fused[sec])
+            if p > best_prob:
+                best_prob = p
+                best_sec = sec
+
+        if best_sec is None:
+            # 理论上不会走到这里，如果走到，退回到全局 argmax 以避免崩溃
+            return int(prob_fused.argmax())
+
+        return int(best_sec)
+
+    @torch.no_grad()
+    def anomaly_score(self, wav_path: str, section_id: int) -> float:
+        if section_id not in self.anomaly_models:
+            raise ValueError(f"No anomaly model found for section {section_id}")
+        fv = extract_feature_vector(wav_path)
+        x = torch.from_numpy(fv).unsqueeze(0).to(self.device)  # [1, D]
+        mlp = self.anomaly_models[section_id]
+        logit = mlp(x)  # [1]
+        prob_normal = torch.sigmoid(logit).item()
+        # 将“异常得分”定义为 1 - P(normal)，值越大越异常
+        score = 1.0 - prob_normal
+        return float(score)
+
+    @torch.no_grad()
+    def predict(self, wav_path: str) -> Dict[str, object]:
+        sec = self.predict_section(wav_path)
+        score = self.anomaly_score(wav_path, sec)
+        # 某些老的/不完整的异常模型可能缺失某个 section 的阈值，这里做一下容错
+        if sec not in self.thresholds:
+            print(
+                f"[ValveAnomalyPipeline] Warning: no threshold found for section {sec}, "
+                "use default 0.5."
+            )
+            th = 0.5
+        else:
+            th = float(self.thresholds[sec])
+        is_normal = score <= th
+        return {
+            "section": sec,
+            "anomaly_score": score,
+            "threshold": th,
+            "is_normal": is_normal,
+        }
+
+    @torch.no_grad()
+    def predict_with_true_section(self, wav_path: str, section_id: int) -> Dict[str, object]:
+        """
+        只关心“是否正常”的场景下，如果你已经知道真实的 section_id（例如从文件名/设备信息获得），
+        可以直接绕过 section 分类器，只使用对应 section 的异常检测 MLP。
+
+        这样做的好处：
+        - 不再受 section 分类错误的影响
+        - 最终 normal/abnormal 的准确率理论上可以接近每个 section 上 AnomMLP 的 val_acc（~0.86–0.89）
+        """
+        if section_id not in self.anomaly_models:
+            raise ValueError(f"No anomaly model found for section {section_id}")
+        score = self.anomaly_score(wav_path, section_id)
+        if section_id not in self.thresholds:
+            print(
+                f"[ValveAnomalyPipeline] Warning: no threshold found for section {section_id}, "
+                "use default 0.5."
+            )
+            th = 0.5
+        else:
+            th = float(self.thresholds[section_id])
+        is_normal = score <= th
+        return {
+            "section": section_id,
+            "anomaly_score": score,
+            "threshold": th,
+            "is_normal": is_normal,
+        }
+
+    def explain_anomaly(
+        self,
+        wav_path: str,
+        section_id: int | None = None,
+        use_true_section: bool = False,
+    ) -> Dict[str, object]:
+        """
+        对单条音频做“异常检测 + 特征类型解释”：
+        - 返回正常/异常结果及分数
+        - 同时给出各类特征块（mel / MFCC / 频谱 / 时域 / 工业特征）对异常得分的相对重要性
+
+        说明：
+        - 不需要重新训练模型，仅基于当前 SectionAnomalyMLP 的梯度进行简单解释
+        - importance 值越大，说明该特征块对“异常”的贡献越大
+        - 若存在正常基线（mean/std），会计算每一类特征的 z-score，并给出 is_abnormal 标记
+        """
+        # 1) 选择使用的 section
+        if use_true_section and section_id is not None:
+            sec = int(section_id)
+        else:
+            sec = int(self.predict_section(wav_path))
+
+        if sec not in self.anomaly_models:
+            raise ValueError(f"No anomaly model found for section {sec}")
+
+        # 2) 提取特征向量，并开启梯度
+        fv = extract_feature_vector(wav_path)  # [D] numpy
+        x = torch.from_numpy(fv).unsqueeze(0).to(self.device)  # [1, D]
+        x.requires_grad_(True)
+
+        mlp = self.anomaly_models[sec]
+        mlp.zero_grad()
+
+        # 3) 前向 & 计算异常得分
+        logit = mlp(x)  # [1]
+        prob_normal = torch.sigmoid(logit)  # [1]
+        score = float(1.0 - prob_normal.item())  # 异常得分
+        # 这里也做与 predict 一致的容错：某些 section 可能缺少阈值
+        if sec not in self.thresholds:
+            print(
+                f"[ValveAnomalyPipeline] Warning: no threshold found for section {sec} "
+                "when explaining anomaly, use default 0.5."
+            )
+            th = 0.5
+        else:
+            th = float(self.thresholds[sec])
+        is_normal = score <= th
+
+        # 4) 以“异常概率”作为目标，反向传播得到各维特征的重要性
+        # 目标越大，说明越异常，因此对 objective 的正向梯度可视作“推动异常”的方向
+        objective = 1.0 - prob_normal  # 标量
+        objective.backward()
+
+        grads = x.grad.detach().cpu().numpy()[0]  # [D]
+        fv_np = fv  # [D]
+
+        # 使用 |grad * feature| 作为简单的重要性度量
+        raw_importance = np.abs(grads * fv_np)  # [D]
+        total_imp = float(raw_importance.sum())
+        if total_imp <= 0.0:
+            imp_norm = np.zeros_like(raw_importance, dtype=np.float32)
+        else:
+            imp_norm = (raw_importance / total_imp).astype(np.float32)
+
+        # 5) 汇总到“特征类型块”级别的贡献
+        D = imp_norm.shape[0]
+        mel_dim = 2 * N_MELS  # mel 统计特征长度
+        # 其余维度根据实现拆分：mfcc_block + spectral(6) + temporal(4) + industrial(4)
+        remaining = D - mel_dim
+        spectral_dim = 6
+        temporal_dim = 4
+        industrial_dim = 4
+        mfcc_dim = max(remaining - spectral_dim - temporal_dim - industrial_dim, 0)
+
+        idx = 0
+        mel_slice = imp_norm[idx: idx + mel_dim]
+        idx += mel_dim
+        mfcc_slice = imp_norm[idx: idx + mfcc_dim]
+        idx += mfcc_dim
+        spectral_slice = imp_norm[idx: idx + spectral_dim]
+        idx += spectral_dim
+        temporal_slice = imp_norm[idx: idx + temporal_dim]
+        idx += temporal_dim
+        industrial_slice = imp_norm[idx: idx + industrial_dim]
+
+        def _sum(slice_arr: np.ndarray) -> float:
+            return float(slice_arr.sum(dtype=np.float32))
+
+        # 先算出各类特征的 importance
+        groups_raw = [
+            ("mel_stats", _sum(mel_slice)),
+            ("mfcc_delta", _sum(mfcc_slice)),
+            ("spectral", _sum(spectral_slice)),
+            ("temporal", _sum(temporal_slice)),
+            ("industrial", _sum(industrial_slice)),
+        ]
+
+        # 若存在“正常基线”，使用 z-score + importance 共同判断是否异常
+        baseline_for_sec = self.feature_baseline.get(sec, {})
+
+        feature_groups: list[Dict[str, object]] = []
+        for name, imp in groups_raw:
+            stats = baseline_for_sec.get(name)
+            z_score: float | None = None
+            is_abnormal = False
+
+            if stats is not None:
+                mu = float(stats.get("mean", 0.0))
+                std = float(stats.get("std", 1e-6))
+                z_score = (imp - mu) / (std + 1e-6)
+                # 规则：该特征在该条音频中贡献较大，且相对正常样本显著偏高 → 判为异常
+                # importance 阈值 0.3 + z-score 阈值 2.0
+                if imp >= 0.3 and z_score >= 2.0:
+                    is_abnormal = True
+            else:
+                # 没有基线时，仅用 importance 做一个简单判断
+                if imp >= 0.4:
+                    is_abnormal = True
+
+            feature_groups.append(
+                {
+                    "name": name,
+                    "importance": float(imp),
+                    "z_score": float(z_score) if z_score is not None else None,
+                    "is_abnormal": is_abnormal,
+                }
+            )
+
+        # 6) 结合 importance + 正常基线，给出 z_score 和 is_abnormal 标记
+        baseline_for_section = self.feature_baseline.get(str(sec), {})
+        for g in feature_groups:
+            name = g["name"]
+            imp = float(g["importance"])
+            stats = baseline_for_section.get(name)
+
+            if stats is not None:
+                mean = float(stats.get("mean", 0.0))
+                std = float(stats.get("std", 1e-6))
+                p95 = float(stats.get("p95", 1.0))
+                if std <= 1e-6:
+                    z = 0.0
+                else:
+                    z = (imp - mean) / std
+                # 规则：importance 本身要足够大，并且明显高于“正常”
+                is_abnormal_fg = (imp >= 0.3) and (z >= 2.0 or imp >= p95)
+            else:
+                # 如果还没有基线，就用简单经验规则：importance>=0.4 视为异常
+                z = 0.0
+                is_abnormal_fg = imp >= 0.4
+
+            g["z_score"] = float(z)
+            g["is_abnormal"] = bool(is_abnormal_fg)
+
+        return {
+            "section": sec,
+            "anomaly_score": score,
+            "threshold": th,
+            "is_normal": is_normal,
+            "feature_groups": feature_groups,
+        }
+
+    def compute_feature_baseline(
+        self,
+        max_files_per_section: int = 200,
+        save_path: str | None = None,
+    ) -> Dict[str, Dict[str, Dict[str, float]]]:
+        """
+        基于“正常样本”统计各特征类型的 importance 分布，用于后续解释：
+        - 对每个 section、每个特征组，计算 mean / std / p95 / count
+        - 结果写入 feature_baseline.json，并加载到 self.feature_baseline
+
+        只使用当前设备的数据（self.data_root）。
+        """
+        baseline: Dict[str, Dict[str, Dict[str, float]]] = {}
+
+        sections = sorted(self.anomaly_models.keys())
+        if not sections:
+            print("[FeatureBaseline] No anomaly models to build baseline for.")
+            return baseline
+
+        for sec in sections:
+            files, labels = collect_section_all_labeled_files(self.data_root, sec)
+            normal_files = [p for p, y in zip(files, labels) if y == 1]
+            if not normal_files:
+                print(f"[FeatureBaseline] section {sec:02d}: no normal files, skip.")
+                continue
+
+            if max_files_per_section > 0 and len(normal_files) > max_files_per_section:
+                rng = np.random.RandomState(0)
+                idx = rng.choice(len(normal_files), size=max_files_per_section, replace=False)
+                normal_files = [normal_files[i] for i in idx]
+
+            group_values: Dict[str, list[float]] = {
+                "mel_stats": [],
+                "mfcc_delta": [],
+                "spectral": [],
+                "temporal": [],
+                "industrial": [],
+            }
+
+            print(
+                f"[FeatureBaseline] section {sec:02d}: using {len(normal_files)} normal files "
+                "to build feature importance baseline."
+            )
+
+            for p in normal_files:
+                res = self.explain_anomaly(
+                    p,
+                    section_id=sec,
+                    use_true_section=True,
+                )
+                for g in res.get("feature_groups", []):
+                    name = g.get("name")
+                    imp = float(g.get("importance", 0.0))
+                    if name in group_values:
+                        group_values[name].append(imp)
+
+            section_stats: Dict[str, Dict[str, float]] = {}
+            for name, vals in group_values.items():
+                if not vals:
+                    continue
+                arr = np.asarray(vals, dtype=np.float32)
+                mean = float(arr.mean())
+                std = float(arr.std() + 1e-6)
+                p95 = float(np.percentile(arr, 95))
+                section_stats[name] = {
+                    "mean": mean,
+                    "std": std,
+                    "p95": p95,
+                    "count": float(len(vals)),
+                }
+
+            baseline[str(sec)] = section_stats
+
+        if save_path is None:
+            save_path = os.path.join(self.model_dir, "feature_baseline.json")
+
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(baseline, f, ensure_ascii=False, indent=2)
+
+        self.feature_baseline = baseline
+        print(f"[FeatureBaseline] saved to {save_path}")
+        return baseline
 
 
 class MachineTypePipeline:
@@ -1525,76 +1913,6 @@ def evaluate_machine_type_classifier(
 
     return overall_acc
 
-    @torch.no_grad()
-    def predict_section(self, wav_path: str) -> int:
-        # CNN 分支（log-mel 频谱）
-        x = extract_feature(wav_path)
-        xt = torch.from_numpy(x).unsqueeze(0).to(self.device)
-        logits_cnn = self.section_model(xt)  # [1, n_sections]
-        prob_cnn = F.softmax(logits_cnn, dim=1).cpu().numpy()[0]
-
-        if self.section_mlp is None:
-            return int(prob_cnn.argmax())
-
-        # MLP 分支（手工特征）
-        fv = extract_feature_vector(wav_path)
-        xf = torch.from_numpy(fv).unsqueeze(0).to(self.device)  # [1, D]
-        logits_mlp = self.section_mlp(xf)  # [1, n_sections]
-        prob_mlp = F.softmax(logits_mlp, dim=1).cpu().numpy()[0]
-
-        # 简单平均融合（你可以根据效果再调整权重）
-        prob_fused = 0.5 * prob_cnn + 0.5 * prob_mlp
-        pred = int(prob_fused.argmax())
-        return pred
-
-    @torch.no_grad()
-    def anomaly_score(self, wav_path: str, section_id: int) -> float:
-        if section_id not in self.anomaly_models:
-            raise ValueError(f"No anomaly model found for section {section_id}")
-        fv = extract_feature_vector(wav_path)
-        x = torch.from_numpy(fv).unsqueeze(0).to(self.device)  # [1, D]
-        mlp = self.anomaly_models[section_id]
-        logit = mlp(x)  # [1]
-        prob_normal = torch.sigmoid(logit).item()
-        # 将“异常得分”定义为 1 - P(normal)，值越大越异常
-        score = 1.0 - prob_normal
-        return float(score)
-
-    @torch.no_grad()
-    def predict(self, wav_path: str) -> Dict[str, object]:
-        sec = self.predict_section(wav_path)
-        score = self.anomaly_score(wav_path, sec)
-        th = float(self.thresholds[sec])
-        is_normal = score <= th
-        return {
-            "section": sec,
-            "anomaly_score": score,
-            "threshold": th,
-            "is_normal": is_normal,
-        }
-
-    @torch.no_grad()
-    def predict_with_true_section(self, wav_path: str, section_id: int) -> Dict[str, object]:
-        """
-        只关心“是否正常”的场景下，如果你已经知道真实的 section_id（例如从文件名/设备信息获得），
-        可以直接绕过 section 分类器，只使用对应 section 的异常检测 MLP。
-
-        这样做的好处：
-        - 不再受 section 分类错误的影响
-        - 最终 normal/abnormal 的准确率理论上可以接近每个 section 上 AnomMLP 的 val_acc（~0.86–0.89）
-        """
-        if section_id not in self.anomaly_models:
-            raise ValueError(f"No anomaly model found for section {section_id}")
-        score = self.anomaly_score(wav_path, section_id)
-        th = float(self.thresholds[section_id])
-        is_normal = score <= th
-        return {
-            "section": section_id,
-            "anomaly_score": score,
-            "threshold": th,
-            "is_normal": is_normal,
-        }
-
 
 # -----------------------------
 # 示例 main：先训练，再推理一条音频
@@ -1644,6 +1962,11 @@ def main():
         "--eval_machine_classifier",
         action="store_true",
         help="在 multi_data_root 下的所有设备数据上，评估设备类型分类模型的整体和逐类准确率",
+    )
+    parser.add_argument(
+        "--compute_feature_baseline",
+        action="store_true",
+        help="基于正常样本为当前设备计算特征重要性基线（用于后续解释特征是否异常）",
     )
     parser.add_argument(
         "--debug_labels",
@@ -1716,6 +2039,13 @@ def main():
             multi_data_root=args.multi_data_root,
             device=device,
         )
+
+    if args.compute_feature_baseline:
+        pipeline = ValveAnomalyPipeline(
+            data_root=args.data_root,
+            device=device,
+        )
+        pipeline.compute_feature_baseline()
 
 
 if __name__ == "__main__":

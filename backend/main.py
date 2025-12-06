@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from valve_anomaly_pipeline import (
+from .valve_anomaly_pipeline import (
     get_device,
     MachineTypePipeline,
     ValveAnomalyPipeline,
